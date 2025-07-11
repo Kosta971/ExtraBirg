@@ -1,3 +1,4 @@
+eventlet>=0.24.1
 flask
 flask-sqlalchemy
 flask-socketio

@@ -1084,3 +1084,196 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
     socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+from flask import Flask, render_template_string, request, redirect, session, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit
+from werkzeug.security import generate_password_hash, check_password_hash
+import requests, os, uuid, datetime
+from functools import wraps
+import pickle  # Для корректной работы с PickleType
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "supersecret")
+
+# Конфигурация БД для Render (поддерживает SQLite и PostgreSQL)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///xtrabirg.db').replace("postgres://", "postgresql://", 1)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# Конфигурация API
+NOWPAYMENTS_API = os.getenv("NOWPAYMENTS_API_KEY")
+STRIPE_PUBKEY = os.getenv("STRIPE_PUBKEY", "")
+STRIPE_SECRET = os.getenv("STRIPE_SECRET", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "adminpass")
+
+SUPPORTED_TOKENS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "DOGE": "dogecoin",
+    "XTRA": "usd"
+}
+
+# Модели базы данных с исправленным PickleType
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    balances = db.Column(db.PickleType, nullable=False, default=pickle.dumps({"USDT": 0.0, "BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "DOGE": 0.0, "XTRA": 0.0}))
+
+    def get_balances(self):
+        return pickle.loads(self.balances) if isinstance(self.balances, bytes) else self.balances
+
+    def set_balances(self, balances):
+        self.balances = pickle.dumps(balances)
+
+class Transaction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_email = db.Column(db.String(120), nullable=False)
+    type = db.Column(db.String(50), nullable=False)
+    token = db.Column(db.String(10), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+# Создание таблиц при первом запросе
+@app.before_first_request
+def initialize_database():
+    try:
+        db.create_all()
+        print("✅ Таблицы базы данных успешно созданы!")
+    except Exception as e:
+        print(f"❌ Ошибка при создании таблиц БД: {e}")
+
+# Вспомогательные функции
+def get_price(token):
+    if token == "XTRA":
+        return 1.0
+    try:
+        name = SUPPORTED_TOKENS.get(token)
+        if not name:
+            return 0.0
+        res = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={name}&vs_currencies=usd", timeout=5)
+        res.raise_for_status()
+        return res.json()[name]['usd']
+    except Exception as e:
+        print(f"Error fetching price for {token}: {e}")
+        return 0.0
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user' not in session:
+            return redirect('/')
+        return f(*args, **kwargs)
+    return decorated
+
+def require_admin(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('admin'):
+            return redirect('/admin-login')
+        return f(*args, **kwargs)
+    return decorated
+
+# Маршруты аутентификации (исправленные)
+@app.route('/register', methods=['POST'])
+def register():
+    try:
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '').strip()
+        
+        if not email or not password:
+            return "Email and password are required", 400
+        
+        if User.query.filter_by(email=email).first():
+            return "Email already registered", 400
+            
+        user = User(
+            email=email,
+            password_hash=generate_password_hash(password),
+            balances=pickle.dumps({"USDT": 0.0, "BTC": 0.0, "ETH": 0.0, "SOL": 0.0, "DOGE": 0.0, "XTRA": 0.0})
+        )
+        
+        db.session.add(user)
+        db.session.commit()
+        session['user'] = email
+        return redirect('/')
+    except Exception as e:
+        db.session.rollback()
+        print(f"Registration error: {str(e)}")
+        return f"Registration failed: {str(e)}", 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    try:
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '').strip()
+        
+        user = User.query.filter_by(email=email).first()
+        if not user or not check_password_hash(user.password_hash, password):
+            return "Invalid credentials", 401
+            
+        session['user'] = email
+        return redirect('/')
+    except Exception as e:
+        print(f"Login error: {str(e)}")
+        return "Server error during login", 500
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    session.pop('admin', None)
+    return redirect('/')
+
+# Маршруты торговли (исправленные)
+@app.route('/buy', methods=['POST'])
+@require_auth
+def buy():
+    try:
+        token = request.form.get('token')
+        amount = float(request.form.get('amount', 0))
+        
+        if token not in SUPPORTED_TOKENS:
+            return "Unsupported token", 400
+        if amount <= 0:
+            return "Amount must be positive", 400
+            
+        user = User.query.filter_by(email=session['user']).first()
+        if not user:
+            return "User not found", 404
+            
+        price = get_price(token)
+        total = amount * price
+        
+        balances = user.get_balances()
+        if balances.get('USDT', 0) < total:
+            return "Insufficient USDT balance", 400
+            
+        balances['USDT'] -= total
+        balances[token] = balances.get(token, 0) + amount
+        user.set_balances(balances)
+        
+        db.session.add(Transaction(
+            user_email=user.email,
+            type="buy",
+            token=token,
+            amount=amount,
+            price=price
+        ))
+        db.session.commit()
+        return redirect('/')
+    except Exception as e:
+        db.session.rollback()
+        print(f"Buy error: {str(e)}")
+        return f"Transaction failed: {str(e)}", 500
+
+# Остальные маршруты остаются без изменений (deposit, stripe, history и т.д.)
+# ... (вставьте сюда остальные маршруты из вашего исходного кода)
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)

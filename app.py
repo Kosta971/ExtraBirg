@@ -1080,7 +1080,12 @@ def get_price_endpoint():
     token = request.args.get('token')
     return jsonify({"price": get_price(token)})
 
-if name == 'main':
-with app.app_context():
-db.create_all()
-socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
++if name == 'main':
+
++with app.app_context():
+
+
+
++db.create_all()
+
+ +socketio.run(app, host='0.0.0.0', port= 5000, allow_unsafe_werkzeug=True)
